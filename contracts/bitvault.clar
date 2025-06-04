@@ -449,3 +449,208 @@
     )
   )
 )
+
+;; Withdraw BTC collateral
+(define-public (withdraw-collateral (amount-to-withdraw uint))
+  (let (
+      (user tx-sender)
+      (vault-data-option (map-get? vaults { owner: user }))
+    )
+    (begin
+      (try! (assert-not-paused))
+      (asserts! (> amount-to-withdraw u0) ERR_INVALID_AMOUNT)
+      (asserts! (is-some vault-data-option) ERR_VAULT_NOT_FOUND)
+      (let (
+          (vault-data (unwrap-panic vault-data-option))
+          (updated-vault (update-interest vault-data))
+        )
+        ;; Check if withdrawal would leave enough collateral
+        (asserts! (<= amount-to-withdraw (get collateral-amount updated-vault))
+          ERR_INSUFFICIENT_COLLATERAL
+        )
+        (let (
+            (new-collateral-amount (- (get collateral-amount updated-vault) amount-to-withdraw))
+            (total-debt (+ (get borrowed-amount updated-vault)
+              (get interest-accumulated updated-vault)
+            ))
+          )
+          ;; If there's outstanding debt, check collateralization ratio
+          (if (> total-debt u0)
+            (let ((collateral-value-result (calculate-collateral-value new-collateral-amount)))
+              (if (is-err collateral-value-result)
+                collateral-value-result
+                (let (
+                    (new-collateral-value (unwrap-panic collateral-value-result))
+                    (min-collateral-needed (mul-div total-debt (var-get minimum-collateral-ratio) u100))
+                  )
+                  (asserts!
+                    (>= new-collateral-value (unwrap-panic min-collateral-needed))
+                    ERR_MINIMUM_COLLATERAL_RATIO
+                  )
+                  ;; Update vault
+                  (map-set vaults { owner: user } {
+                    collateral-amount: new-collateral-amount,
+                    borrowed-amount: (get borrowed-amount updated-vault),
+                    interest-accumulated: (get interest-accumulated updated-vault),
+                    last-interest-update: stacks-block-height,
+                  })
+                  ;; Update total collateral
+                  (var-set total-collateral
+                    (- (var-get total-collateral) amount-to-withdraw)
+                  )
+                  ;; In production, this would trigger a Bitcoin transaction to return funds
+                  ;; For now, we just track the amount
+                  (ok amount-to-withdraw)
+                )
+              )
+            )
+            ;; If no debt, allow full withdrawal
+            (begin
+              ;; Update vault
+              (map-set vaults { owner: user } {
+                collateral-amount: new-collateral-amount,
+                borrowed-amount: u0,
+                interest-accumulated: u0,
+                last-interest-update: stacks-block-height,
+              })
+              ;; Update total collateral
+              (var-set total-collateral
+                (- (var-get total-collateral) amount-to-withdraw)
+              )
+              ;; In production, this would trigger a Bitcoin transaction to return funds
+              ;; For now, we just track the amount
+              (ok amount-to-withdraw)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Liquidation System
+
+;; Liquidate an undercollateralized vault
+(define-public (liquidate (vault-owner principal))
+  (let ((vault-data-option (map-get? vaults { owner: vault-owner })))
+    (begin
+      (try! (assert-not-paused))
+      ;; Prevent liquidation of contract owner/privileged accounts
+      (asserts! (not (is-eq vault-owner (var-get contract-owner)))
+        ERR_UNAUTHORIZED
+      )
+      (asserts! (is-some vault-data-option) ERR_VAULT_NOT_FOUND)
+      (let (
+          (vault-data (unwrap-panic vault-data-option))
+          (updated-vault (update-interest vault-data))
+        )
+        ;; Check if vault is undercollateralized
+        (asserts! (is-undercollateralized updated-vault)
+          ERR_VAULT_NOT_UNDERCOLLATERALIZED
+        )
+        ;; Calculate liquidation values
+        (let (
+            (collateral-value-result (calculate-collateral-value (get collateral-amount updated-vault)))
+            (total-debt (+ (get borrowed-amount updated-vault)
+              (get interest-accumulated updated-vault)
+            ))
+          )
+          (if (is-err collateral-value-result)
+            collateral-value-result
+            (let (
+                (collateral-value (unwrap-panic collateral-value-result))
+                (liquidation-amount-result (mul-div total-debt (+ u100 (var-get liquidation-penalty)) u100))
+              )
+              (if (is-err liquidation-amount-result)
+                liquidation-amount-result
+                (let ((liquidation-amount (unwrap-panic liquidation-amount-result)))
+                  ;; Calculate how much collateral to liquidate
+                  (let ((btc-to-liquidate-result (if (> liquidation-amount collateral-value)
+                      (ok (get collateral-amount updated-vault)) ;; Liquidate all if underwater
+                      (mul-div (get collateral-amount updated-vault)
+                        liquidation-amount collateral-value
+                      )
+                    )))
+                    (if (is-err btc-to-liquidate-result)
+                      btc-to-liquidate-result
+                      (let ((btc-to-liquidate (unwrap-panic btc-to-liquidate-result)))
+                        ;; Calculate bonus for liquidator
+                        (let ((liquidator-bonus-result (mul-div btc-to-liquidate (var-get liquidation-penalty)
+                            u100
+                          )))
+                          (if (is-err liquidator-bonus-result)
+                            liquidator-bonus-result
+                            (let ((liquidator-bonus (unwrap-panic liquidator-bonus-result)))
+                              ;; Calculate borrowed amount to reduce
+                              (let ((borrowed-amount-reduction-result (if (> liquidation-amount total-debt)
+                                  (ok (get borrowed-amount updated-vault))
+                                  (mul-div (get borrowed-amount updated-vault)
+                                    liquidation-amount total-debt
+                                  )
+                                )))
+                                (if (is-err borrowed-amount-reduction-result)
+                                  borrowed-amount-reduction-result
+                                  (let ((borrowed-amount-reduction (unwrap-panic borrowed-amount-reduction-result)))
+                                    ;; Calculate interest to reduce
+                                    (let ((interest-reduction-result (if (> liquidation-amount total-debt)
+                                        (ok (get interest-accumulated updated-vault))
+                                        (mul-div
+                                          (get interest-accumulated updated-vault)
+                                          liquidation-amount total-debt
+                                        )
+                                      )))
+                                      (if (is-err interest-reduction-result)
+                                        interest-reduction-result
+                                        (let ((interest-reduction (unwrap-panic interest-reduction-result)))
+                                          ;; Update vault
+                                          (map-set vaults { owner: vault-owner } {
+                                            collateral-amount: (-
+                                              (get collateral-amount
+                                                updated-vault
+                                              )
+                                              btc-to-liquidate
+                                            ),
+                                            borrowed-amount: (-
+                                              (get borrowed-amount updated-vault)
+                                              borrowed-amount-reduction
+                                            ),
+                                            interest-accumulated: (-
+                                              (get interest-accumulated
+                                                updated-vault
+                                              )
+                                              interest-reduction
+                                            ),
+                                            last-interest-update: stacks-block-height,
+                                          })
+                                          ;; Update total collateral and borrowed
+                                          (var-set total-collateral
+                                            (- (var-get total-collateral)
+                                              btc-to-liquidate
+                                            ))
+                                          (var-set total-borrowed
+                                            (- (var-get total-borrowed)
+                                              borrowed-amount-reduction
+                                            ))
+                                          ;; Return the amount of BTC liquidated
+                                          (ok btc-to-liquidate)
+                                        )
+                                      )
+                                    )
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
